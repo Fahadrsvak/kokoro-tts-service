@@ -1,17 +1,22 @@
 FROM python:3.11-slim
+
 WORKDIR /app
 
+# Install system dependencies (espeak-ng is required by Kokoro phonemizer)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget espeak-ng \
+    espeak-ng \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir kokoro-onnx websockets numpy "misaki[en]"
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx \
-    && wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+# Pre-download ONNX model and voices into container image
+COPY download_weights.py .
+RUN python download_weights.py
 
-COPY server.py /app/
-EXPOSE 6007
+COPY server.py .
 
-ENV PYTHONUNBUFFERED=1
+EXPOSE 8880
+
 CMD ["python", "server.py"]

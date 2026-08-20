@@ -5,7 +5,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: kokoro-tts
-    restart: always
+    restart: unless-stopped
     expose:
       - "6007"
     networks:
