@@ -12,4 +12,6 @@ RUN wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-
 
 COPY server.py /app/
 EXPOSE 6007
+
+ENV PYTHONUNBUFFERED=1
 CMD ["python", "server.py"]
