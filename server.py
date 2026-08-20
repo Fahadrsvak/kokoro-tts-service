@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import logging
 import websockets
 import numpy as np
@@ -16,13 +17,12 @@ VOICES_PATH = os.path.join(WEIGHTS_DIR, "voices-v1.0.bin")
 logging.info("Initializing Kokoro ONNX model into memory...")
 kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
 
-# Warmup both model and phonemizer
 async def warmup():
     try:
         logging.info("Warming up execution pipeline...")
-        async for _ in kokoro.create_stream("Hello", voice="af_heart", speed=1.0, lang="en-us"):
+        async for _ in kokoro.create_stream("Warmup test.", voice="af_heart", speed=1.0, lang="en-us"):
             pass
-        logging.info("Kokoro ONNX engine ready and pre-warmed.")
+        logging.info("Warmup complete.")
     except Exception as err:
         logging.warning(f"Warmup warning: {err}")
 
@@ -31,10 +31,10 @@ def split_into_sentences(text: str):
     return [s.strip() for s in sentences if s.strip()]
 
 async def tts_handler(websocket):
-    client_ip = websocket.remote_address[0]
-    
     try:
         async for message in websocket:
+            request_start_time = time.perf_counter()
+            
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
@@ -49,14 +49,33 @@ async def tts_handler(websocket):
             if not text:
                 continue
 
-            # 1. Send start signal immediately to acknowledge request
             await websocket.send(json.dumps({"type": "start", "sample_rate": 24000}))
 
             sentences = split_into_sentences(text)
 
             try:
-                for sentence in sentences:
-                    # 2. Consume the async generator stream directly
+                for sentence_idx, sentence in enumerate(sentences):
+                    logging.info(f"\n==================================================")
+                    logging.info(f"Processing [{sentence_idx+1}/{len(sentences)}]: '{sentence}'")
+                    
+                    # ---------------------------------------------------------
+                    # 1. ISOLATED G2P / PHONEMIZATION STEP (espeak-ng)
+                    # ---------------------------------------------------------
+                    g2p_start = time.perf_counter()
+                    try:
+                        phonemes, _ = await kokoro.phonemize(sentence, lang=lang)
+                    except AttributeError:
+                        # Fallback for older kokoro-onnx versions if phonemize isn't async
+                        phonemes = kokoro.phonemize(sentence, lang=lang)
+                    g2p_duration = (time.perf_counter() - g2p_start) * 1000
+                    
+                    logging.info(f"🗣️ [STAGE 1] G2P / Phonemizer (espeak-ng): {g2p_duration:.2f} ms")
+                    logging.info(f"   ↳ Phonemes generated: '{phonemes}'")
+
+                    # ---------------------------------------------------------
+                    # 2. ISOLATED ONNX INFERENCE + STREAMING STEP
+                    # ---------------------------------------------------------
+                    stream_start = time.perf_counter()
                     stream = kokoro.create_stream(
                         text=sentence,
                         voice=voice,
@@ -64,17 +83,47 @@ async def tts_handler(websocket):
                         lang=lang
                     )
 
-                    async for samples, sample_rate in stream:
-                        # Convert float32 array to 16-bit PCM binary
-                        pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-                        # Stream individual frame chunk to network instantly
-                        await websocket.send(pcm_samples.tobytes())
+                    chunk_count = 0
+                    first_chunk = True
+                    total_onnx_time = 0.0
+                    total_pcm_time = 0.0
+                    total_send_time = 0.0
 
-                # 3. Send completion signal
+                    async for samples, sample_rate in stream:
+                        chunk_count += 1
+                        
+                        if first_chunk:
+                            ttfa_ms = (time.perf_counter() - request_start_time) * 1000
+                            first_chunk_onnx = (time.perf_counter() - stream_start) * 1000
+                            logging.info(f"⚡ [STAGE 2] First Audio Frame ONNX Synthesis: {first_chunk_onnx:.2f} ms")
+                            logging.info(f"🚀 [TTFA] Total Latency To First Audio Frame: {ttfa_ms:.2f} ms")
+                            first_chunk = False
+
+                        # Measure PCM quantisation timing
+                        pcm_start = time.perf_counter()
+                        pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+                        pcm_bytes = pcm_samples.tobytes()
+                        total_pcm_time += (time.perf_counter() - pcm_start) * 1000
+
+                        # Measure WebSocket send timing
+                        send_start = time.perf_counter()
+                        await websocket.send(pcm_bytes)
+                        total_send_time += (time.perf_counter() - send_start) * 1000
+
+                    sentence_stream_duration = (time.perf_counter() - stream_start) * 1000
+                    
+                    logging.info(f"🎛️ [STAGE 2] Total Synthesis Streaming: {sentence_stream_duration:.2f} ms")
+                    logging.info(f"   ↳ PCM Array Processing Total: {total_pcm_time:.2f} ms")
+                    logging.info(f"   ↳ Network Send Total: {total_send_time:.2f} ms")
+                    logging.info(f"✅ Sentence Total: {(time.perf_counter() - g2p_start) * 1000:.2f} ms | Chunks: {chunk_count}")
+
                 await websocket.send(json.dumps({"type": "end", "status": "EOF", "sample_rate": 24000}))
+                
+                total_request_time = (time.perf_counter() - request_start_time) * 1000
+                logging.info(f"🏁 End-to-End Request Duration: {total_request_time:.2f} ms\n")
 
             except Exception as e:
-                logging.error(f"Error during synthesis stream: {e}")
+                logging.error(f"Error during synthesis stream: {e}", exc_info=True)
                 await websocket.send(json.dumps({"type": "error", "error": str(e)}))
 
     except websockets.exceptions.ConnectionClosed:
@@ -84,7 +133,7 @@ async def main():
     port = 6007
     await warmup()
     async with websockets.serve(tts_handler, "0.0.0.0", port):
-        logging.info(f"🚀 Kokoro WebSocket TTS running on ws://0.0.0.0:{port}")
+        logging.info(f"🚀 Profiling Kokoro TTS running on ws://0.0.0.0:{port}")
         await asyncio.Future()
 
 if __name__ == "__main__":
