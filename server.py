@@ -3,7 +3,6 @@ import json
 import os
 import re
 import logging
-import concurrent.futures
 import websockets
 import numpy as np
 from kokoro_onnx import Kokoro
@@ -17,29 +16,19 @@ VOICES_PATH = os.path.join(WEIGHTS_DIR, "voices-v1.0.bin")
 logging.info("Initializing Kokoro ONNX model into memory...")
 kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
 
-# Thread pool dedicated to CPU-heavy synthesis without freezing asyncio
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-
 # Warmup both model and phonemizer
-try:
-    logging.info("Warming up execution pipeline...")
-    _ = list(kokoro.create_stream("Hello", voice="af_heart", speed=1.0, lang="en-us"))
-    logging.info("Kokoro ONNX engine ready and pre-warmed.")
-except Exception as err:
-    logging.warning(f"Warmup warning: {err}")
+async def warmup():
+    try:
+        logging.info("Warming up execution pipeline...")
+        async for _ in kokoro.create_stream("Hello", voice="af_heart", speed=1.0, lang="en-us"):
+            pass
+        logging.info("Kokoro ONNX engine ready and pre-warmed.")
+    except Exception as err:
+        logging.warning(f"Warmup warning: {err}")
 
 def split_into_sentences(text: str):
     sentences = re.split(r'(?<=[.!?])\s+', text)
     return [s.strip() for s in sentences if s.strip()]
-
-def generate_chunks_blocking(sentence, voice, speed, lang):
-    """Runs inside worker thread to avoid blocking asyncio event loop."""
-    chunks = []
-    stream = kokoro.create_stream(text=sentence, voice=voice, speed=speed, lang=lang)
-    for samples, sample_rate in stream:
-        pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-        chunks.append(pcm_samples.tobytes())
-    return chunks
 
 async def tts_handler(websocket):
     client_ip = websocket.remote_address[0]
@@ -60,23 +49,28 @@ async def tts_handler(websocket):
             if not text:
                 continue
 
-            # 1. Immediately acknowledge request
+            # 1. Send start signal immediately to acknowledge request
             await websocket.send(json.dumps({"type": "start", "sample_rate": 24000}))
 
-            loop = asyncio.get_running_loop()
             sentences = split_into_sentences(text)
 
             try:
                 for sentence in sentences:
-                    # 2. Offload ONNX inference to thread pool
-                    chunks = await loop.run_in_executor(
-                        executor, generate_chunks_blocking, sentence, voice, speed, lang
+                    # 2. Consume the async generator stream directly
+                    stream = kokoro.create_stream(
+                        text=sentence,
+                        voice=voice,
+                        speed=speed,
+                        lang=lang
                     )
-                    
-                    # 3. Stream binary chunks immediately over socket
-                    for chunk in chunks:
-                        await websocket.send(chunk)
 
+                    async for samples, sample_rate in stream:
+                        # Convert float32 array to 16-bit PCM binary
+                        pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+                        # Stream individual frame chunk to network instantly
+                        await websocket.send(pcm_samples.tobytes())
+
+                # 3. Send completion signal
                 await websocket.send(json.dumps({"type": "end", "status": "EOF", "sample_rate": 24000}))
 
             except Exception as e:
@@ -88,8 +82,9 @@ async def tts_handler(websocket):
 
 async def main():
     port = 6007
+    await warmup()
     async with websockets.serve(tts_handler, "0.0.0.0", port):
-        logging.info(f"🚀 Optimized Kokoro TTS running on ws://0.0.0.0:{port}")
+        logging.info(f"🚀 Kokoro WebSocket TTS running on ws://0.0.0.0:{port}")
         await asyncio.Future()
 
 if __name__ == "__main__":
