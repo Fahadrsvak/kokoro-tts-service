@@ -10,25 +10,25 @@ from kokoro_onnx import Kokoro
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# Force ONNX Runtime to use both CPU cores globally
+try:
+    # Set global intra-op threads for matrix operations
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 2
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+except Exception as e:
+    logging.warning(f"Could not set global ONNX thread options: {e}")
+
 WEIGHTS_DIR = "weights"
 MODEL_PATH = os.path.join(WEIGHTS_DIR, "kokoro-v1.0.onnx")
 VOICES_PATH = os.path.join(WEIGHTS_DIR, "voices-v1.0.bin")
 
-# 1. Configure ONNX Multi-Threading Options for ARM CPUs
-session_options = ort.SessionOptions()
-session_options.intra_op_num_threads = 2  # Match available CPU cores
-session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
 # Initialize Kokoro ONNX Model
 logging.info("Initializing Kokoro ONNX model into memory...")
-kokoro = Kokoro(
-    MODEL_PATH, 
-    VOICES_PATH,
-    session_options=session_options
-)
+kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
 
-# 2. Warmup Model to pre-allocate memory buffers before first user request
+# Warmup Model to pre-allocate memory buffers before first user request
 try:
     logging.info("Warming up Kokoro execution engine...")
     _ = list(kokoro.create_stream("Warmup text.", voice="af_heart", speed=1.0, lang="en-us"))
