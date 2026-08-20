@@ -6,7 +6,7 @@ import websockets
 from kokoro_onnx import Kokoro
 from misaki import en, espeak
 
-MODEL_PATH = "kokoro-v1.0.int8.onnx"
+MODEL_PATH = "kokoro-v1.0.onnx"
 VOICES_PATH = "voices-v1.0.bin"
 DEFAULT_VOICE = "af_heart"
 
