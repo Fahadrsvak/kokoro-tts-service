@@ -6,16 +6,40 @@ import time
 import logging
 import websockets
 import numpy as np
+import onnxruntime as ort
 from kokoro_onnx import Kokoro
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 WEIGHTS_DIR = "weights"
-MODEL_PATH = os.path.join(WEIGHTS_DIR, "kokoro-v1.0.onnx")
+# Use INT8 quantized model if available for ~2-3x speedup on CPU
+MODEL_PATH = os.path.join(WEIGHTS_DIR, "kokoro-v1.0.int8.onnx") 
+if not os.path.exists(MODEL_PATH):
+    MODEL_PATH = os.path.join(WEIGHTS_DIR, "kokoro-v1.0.onnx")
+
 VOICES_PATH = os.path.join(WEIGHTS_DIR, "voices-v1.0.bin")
 
-logging.info("Initializing Kokoro ONNX model into memory...")
-kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
+logging.info(f"Loading ONNX Model: {MODEL_PATH}")
+
+# ---------------------------------------------------------
+# OPTIMIZATION 1: Tune ONNX Runtime Session Options
+# ---------------------------------------------------------
+session_options = ort.SessionOptions()
+session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+# Allocate physical CPU threads
+num_cores = os.cpu_count() or 4
+session_options.intra_op_num_threads = num_cores
+session_options.inter_op_num_threads = 2
+
+# Check Execution Providers (CUDA vs CPU)
+providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in ort.get_available_providers() else ["CPUExecutionProvider"]
+
+session = ort.InferenceSession(MODEL_PATH, session_options=session_options, providers=providers)
+logging.info(f"Active Execution Providers: {session.get_providers()}")
+
+kokoro = Kokoro.from_session(session, VOICES_PATH)
 
 async def warmup():
     try:
@@ -52,77 +76,40 @@ async def tts_handler(websocket):
             await websocket.send(json.dumps({"type": "start", "sample_rate": 24000}))
 
             sentences = split_into_sentences(text)
+            first_global_frame = True
 
-            try:
-                for sentence_idx, sentence in enumerate(sentences):
-                    logging.info(f"\n==================================================")
-                    logging.info(f"Processing [{sentence_idx+1}/{len(sentences)}]: '{sentence}'")
-                    
-                    # ---------------------------------------------------------
-                    # 1. ISOLATED G2P / PHONEMIZATION STEP (espeak-ng)
-                    # ---------------------------------------------------------
-                    g2p_start = time.perf_counter()
-                    # Access internal tokenizer directly
-                    phonemes = kokoro.tokenizer.phonemize(sentence, lang)
-                    g2p_duration = (time.perf_counter() - g2p_start) * 1000
-                    
-                    logging.info(f"🗣️ [STAGE 1] G2P / Phonemizer (espeak-ng): {g2p_duration:.2f} ms")
-                    logging.info(f"   ↳ Phonemes generated: '{phonemes}'")
-
-                    # ---------------------------------------------------------
-                    # 2. ISOLATED ONNX INFERENCE + STREAMING STEP
-                    # ---------------------------------------------------------
-                    stream_start = time.perf_counter()
-                    # Pass is_phonemes=True to skip duplicate phonemization
-                    stream = kokoro.create_stream(
-                        text=phonemes,
-                        voice=voice,
-                        speed=speed,
-                        lang=lang,
-                        is_phonemes=True
-                    )
-
-                    chunk_count = 0
-                    first_chunk = True
-                    total_pcm_time = 0.0
-                    total_send_time = 0.0
-
-                    async for samples, sample_rate in stream:
-                        chunk_count += 1
-                        
-                        if first_chunk:
-                            ttfa_ms = (time.perf_counter() - request_start_time) * 1000
-                            first_chunk_onnx = (time.perf_counter() - stream_start) * 1000
-                            logging.info(f"⚡ [STAGE 2] First Audio Frame ONNX Synthesis: {first_chunk_onnx:.2f} ms")
-                            logging.info(f"🚀 [TTFA] Total Latency To First Audio Frame: {ttfa_ms:.2f} ms")
-                            first_chunk = False
-
-                        # Measure PCM quantization timing
-                        pcm_start = time.perf_counter()
-                        pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-                        pcm_bytes = pcm_samples.tobytes()
-                        total_pcm_time += (time.perf_counter() - pcm_start) * 1000
-
-                        # Measure WebSocket send timing
-                        send_start = time.perf_counter()
-                        await websocket.send(pcm_bytes)
-                        total_send_time += (time.perf_counter() - send_start) * 1000
-
-                    sentence_stream_duration = (time.perf_counter() - stream_start) * 1000
-                    
-                    logging.info(f"🎛️ [STAGE 2] Total ONNX Synthesis Streaming: {sentence_stream_duration:.2f} ms")
-                    logging.info(f"   ↳ PCM Array Processing Total: {total_pcm_time:.2f} ms")
-                    logging.info(f"   ↳ Network Send Total: {total_send_time:.2f} ms")
-                    logging.info(f"✅ Sentence Total: {(time.perf_counter() - g2p_start) * 1000:.2f} ms | Chunks: {chunk_count}")
-
-                await websocket.send(json.dumps({"type": "end", "status": "EOF", "sample_rate": 24000}))
+            for sentence_idx, sentence in enumerate(sentences):
+                sentence_start = time.perf_counter()
                 
-                total_request_time = (time.perf_counter() - request_start_time) * 1000
-                logging.info(f"🏁 End-to-End Request Duration: {total_request_time:.2f} ms\n")
+                # 1. G2P Phase
+                phonemes = kokoro.tokenizer.phonemize(sentence, lang)
 
-            except Exception as e:
-                logging.error(f"Error during synthesis stream: {e}", exc_info=True)
-                await websocket.send(json.dumps({"type": "error", "error": str(e)}))
+                # 2. ONNX Generation Phase
+                stream = kokoro.create_stream(
+                    text=phonemes,
+                    voice=voice,
+                    speed=speed,
+                    lang=lang,
+                    is_phonemes=True
+                )
+
+                async for samples, sample_rate in stream:
+                    if first_global_frame:
+                        ttfa_ms = (time.perf_counter() - request_start_time) * 1000
+                        logging.info(f"🚀 [TTFA] Overall Latency To First Audio Frame: {ttfa_ms:.2f} ms")
+                        first_global_frame = False
+
+                    # Convert to PCM16
+                    pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+                    await websocket.send(pcm_samples.tobytes())
+
+                sentence_time = (time.perf_counter() - sentence_start) * 1000
+                logging.info(f"✅ Sentence [{sentence_idx+1}/{len(sentences)}] completed in {sentence_time:.2f} ms")
+
+            await websocket.send(json.dumps({"type": "end", "status": "EOF", "sample_rate": 24000}))
+            
+            total_time = (time.perf_counter() - request_start_time) * 1000
+            logging.info(f"🏁 Request Completed in: {total_time:.2f} ms\n")
 
     except websockets.exceptions.ConnectionClosed:
         pass
@@ -131,7 +118,7 @@ async def main():
     port = 6007
     await warmup()
     async with websockets.serve(tts_handler, "0.0.0.0", port):
-        logging.info(f"🚀 Profiling Kokoro TTS running on ws://0.0.0.0:{port}")
+        logging.info(f"🚀 Optimized Kokoro TTS running on ws://0.0.0.0:{port}")
         await asyncio.Future()
 
 if __name__ == "__main__":
