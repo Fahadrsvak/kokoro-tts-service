@@ -1,4 +1,5 @@
 version: '3.8'
+
 services:
   kokoro-tts:
     build:
@@ -8,8 +9,12 @@ services:
     restart: unless-stopped
     expose:
       - "6007"
+    environment:
+      - OMP_NUM_THREADS=4
+      - OPENBLAS_NUM_THREADS=4
     networks:
       - coolify
+
 networks:
   coolify:
     external: true
