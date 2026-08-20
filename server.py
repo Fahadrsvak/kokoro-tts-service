@@ -62,11 +62,8 @@ async def tts_handler(websocket):
                     # 1. ISOLATED G2P / PHONEMIZATION STEP (espeak-ng)
                     # ---------------------------------------------------------
                     g2p_start = time.perf_counter()
-                    try:
-                        phonemes, _ = await kokoro.phonemize(sentence, lang=lang)
-                    except AttributeError:
-                        # Fallback for older kokoro-onnx versions if phonemize isn't async
-                        phonemes = kokoro.phonemize(sentence, lang=lang)
+                    # Access internal tokenizer directly
+                    phonemes = kokoro.tokenizer.phonemize(sentence, lang)
                     g2p_duration = (time.perf_counter() - g2p_start) * 1000
                     
                     logging.info(f"🗣️ [STAGE 1] G2P / Phonemizer (espeak-ng): {g2p_duration:.2f} ms")
@@ -76,16 +73,17 @@ async def tts_handler(websocket):
                     # 2. ISOLATED ONNX INFERENCE + STREAMING STEP
                     # ---------------------------------------------------------
                     stream_start = time.perf_counter()
+                    # Pass is_phonemes=True to skip duplicate phonemization
                     stream = kokoro.create_stream(
-                        text=sentence,
+                        text=phonemes,
                         voice=voice,
                         speed=speed,
-                        lang=lang
+                        lang=lang,
+                        is_phonemes=True
                     )
 
                     chunk_count = 0
                     first_chunk = True
-                    total_onnx_time = 0.0
                     total_pcm_time = 0.0
                     total_send_time = 0.0
 
@@ -99,7 +97,7 @@ async def tts_handler(websocket):
                             logging.info(f"🚀 [TTFA] Total Latency To First Audio Frame: {ttfa_ms:.2f} ms")
                             first_chunk = False
 
-                        # Measure PCM quantisation timing
+                        # Measure PCM quantization timing
                         pcm_start = time.perf_counter()
                         pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
                         pcm_bytes = pcm_samples.tobytes()
@@ -112,7 +110,7 @@ async def tts_handler(websocket):
 
                     sentence_stream_duration = (time.perf_counter() - stream_start) * 1000
                     
-                    logging.info(f"🎛️ [STAGE 2] Total Synthesis Streaming: {sentence_stream_duration:.2f} ms")
+                    logging.info(f"🎛️ [STAGE 2] Total ONNX Synthesis Streaming: {sentence_stream_duration:.2f} ms")
                     logging.info(f"   ↳ PCM Array Processing Total: {total_pcm_time:.2f} ms")
                     logging.info(f"   ↳ Network Send Total: {total_send_time:.2f} ms")
                     logging.info(f"✅ Sentence Total: {(time.perf_counter() - g2p_start) * 1000:.2f} ms | Chunks: {chunk_count}")
