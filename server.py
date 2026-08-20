@@ -13,7 +13,7 @@ DEFAULT_VOICE = "af_heart"
 print("Loading Kokoro TTS model...")
 kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
 
-print("Loading Misaki G2P (initialized once, reused across every request)...")
+print("Loading Misaki G2P...")
 fallback = espeak.EspeakFallback(british=False)
 g2p = en.G2P(trf=False, british=False, fallback=fallback)
 print("Kokoro + Misaki ready.")
@@ -37,29 +37,32 @@ async def handle_tts_request(websocket):
             if not text:
                 continue
 
-            start = time.time()
             await websocket.send(json.dumps({"type": "start", "text": text}))
 
-            # Phonemize via Misaki instead of kokoro-onnx's default phonemizer
-            # path — Misaki is dictionary-based and only shells out to espeak
-            # for unknown words, avoiding the per-call backend re-init that
-            # was the actual source of the multi-second delay.
+            g2p_start = time.time()
             phonemes, _ = g2p(text)
+            g2p_ms = int((time.time() - g2p_start) * 1000)
+
+            synth_start = time.time()
             samples, sample_rate = kokoro.create(phonemes, voice=voice, speed=speed, is_phonemes=True)
+            synth_ms = int((time.time() - synth_start) * 1000)
+
+            print(f"[TIMING] text={text!r} g2p_ms={g2p_ms} synth_ms={synth_ms}", flush=True)
 
             pcm16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
             await websocket.send(pcm16.tobytes())
 
-            synthesis_ms = int((time.time() - start) * 1000)
             await websocket.send(json.dumps({
                 "type": "end",
                 "text": text,
                 "sample_rate": sample_rate,
-                "synthesis_ms": synthesis_ms
+                "g2p_ms": g2p_ms,
+                "synth_ms": synth_ms,
+                "synthesis_ms": g2p_ms + synth_ms
             }))
 
     except Exception as e:
-        print(f"Connection error: {e}")
+        print(f"Connection error: {e}", flush=True)
 
 async def main():
     async with websockets.serve(handle_tts_request, "0.0.0.0", 6007, max_size=None):
