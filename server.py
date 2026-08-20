@@ -4,6 +4,7 @@ import time
 import numpy as np
 import websockets
 from kokoro_onnx import Kokoro
+from misaki import en, espeak
 
 MODEL_PATH = "kokoro-v1.0.int8.onnx"
 VOICES_PATH = "voices-v1.0.bin"
@@ -11,13 +12,17 @@ DEFAULT_VOICE = "af_heart"
 
 print("Loading Kokoro TTS model...")
 kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
-print("Kokoro TTS model loaded.")
+
+print("Loading Misaki G2P (initialized once, reused across every request)...")
+fallback = espeak.EspeakFallback(british=False)
+g2p = en.G2P(trf=False, british=False, fallback=fallback)
+print("Kokoro + Misaki ready.")
 
 async def handle_tts_request(websocket):
     try:
         async for message in websocket:
             if not isinstance(message, str):
-                continue  # this server expects JSON text requests, not binary
+                continue
 
             try:
                 data = json.loads(message)
@@ -35,10 +40,13 @@ async def handle_tts_request(websocket):
             start = time.time()
             await websocket.send(json.dumps({"type": "start", "text": text}))
 
-            samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang="en-us")
+            # Phonemize via Misaki instead of kokoro-onnx's default phonemizer
+            # path — Misaki is dictionary-based and only shells out to espeak
+            # for unknown words, avoiding the per-call backend re-init that
+            # was the actual source of the multi-second delay.
+            phonemes, _ = g2p(text)
+            samples, sample_rate = kokoro.create(phonemes, voice=voice, speed=speed, is_phonemes=True)
 
-            # Kokoro returns float32 samples in [-1, 1] — convert to int16 PCM
-            # so the client can play it directly via the Web Audio API.
             pcm16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
             await websocket.send(pcm16.tobytes())
 
