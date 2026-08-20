@@ -1,76 +1,61 @@
 import asyncio
 import json
-import os
-import logging
-import websockets
+import time
 import numpy as np
+import websockets
 from kokoro_onnx import Kokoro
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+MODEL_PATH = "kokoro-v1.0.int8.onnx"
+VOICES_PATH = "voices-v1.0.bin"
+DEFAULT_VOICE = "af_heart"
 
-WEIGHTS_DIR = "weights"
-MODEL_PATH = os.path.join(WEIGHTS_DIR, "kokoro-v1.0.onnx")
-VOICES_PATH = os.path.join(WEIGHTS_DIR, "voices-v1.0.bin")
-
-# Initialize Kokoro ONNX Engine
-logging.info("Initializing Kokoro ONNX model into memory...")
+print("Loading Kokoro TTS model...")
 kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
-logging.info("Kokoro ONNX initialized successfully.")
+print("Kokoro TTS model loaded.")
 
-async def tts_handler(websocket):
-    client_ip = websocket.remote_address[0]
-    logging.info(f"Client connected: {client_ip}")
-    
+async def handle_tts_request(websocket):
     try:
         async for message in websocket:
+            if not isinstance(message, str):
+                continue  # this server expects JSON text requests, not binary
+
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
-                logging.warning("Received invalid JSON payload.")
-                await websocket.send(json.dumps({"error": "Invalid JSON format"}))
+                await websocket.send(json.dumps({"type": "error", "error": "Invalid JSON"}))
                 continue
 
             text = data.get("text", "").strip()
-            voice = data.get("voice", "af_sky")
+            voice = data.get("voice", DEFAULT_VOICE)
             speed = float(data.get("speed", 1.0))
-            lang = data.get("lang", "en-us")
 
             if not text:
                 continue
 
-            logging.info(f"Synthesizing text for {client_ip} | Voice: {voice} | Length: {len(text)} chars")
+            start = time.time()
+            await websocket.send(json.dumps({"type": "start", "text": text}))
 
-            try:
-                # Stream audio chunks sentence-by-sentence
-                stream = kokoro.create_stream(
-                    text=text,
-                    voice=voice,
-                    speed=speed,
-                    lang=lang
-                )
+            samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang="en-us")
 
-                async for samples, sample_rate in stream:
-                    # Convert float32 array [-1.0, 1.0] to 16-bit PCM binary
-                    pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-                    pcm_bytes = pcm_samples.tobytes()
-                    
-                    # Stream raw binary audio chunk to client
-                    await websocket.send(pcm_bytes)
+            # Kokoro returns float32 samples in [-1, 1] — convert to int16 PCM
+            # so the client can play it directly via the Web Audio API.
+            pcm16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+            await websocket.send(pcm16.tobytes())
 
-                # Send lightweight JSON EOF signal to mark completion
-                await websocket.send(json.dumps({"status": "EOF", "sample_rate": 24000}))
+            synthesis_ms = int((time.time() - start) * 1000)
+            await websocket.send(json.dumps({
+                "type": "end",
+                "text": text,
+                "sample_rate": sample_rate,
+                "synthesis_ms": synthesis_ms
+            }))
 
-            except Exception as e:
-                logging.error(f"Error during synthesis stream: {e}")
-                await websocket.send(json.dumps({"error": str(e)}))
-
-    except websockets.exceptions.ConnectionClosed:
-        logging.info(f"Client disconnected: {client_ip}")
+    except Exception as e:
+        print(f"Connection error: {e}")
 
 async def main():
-    port = int(os.environ.get("PORT", 8880))
-    async with websockets.serve(tts_handler, "0.0.0.0", port):
-        logging.info(f" Kokoro WebSocket TTS running on ws://0.0.0.0:{port}")
+    async with websockets.serve(handle_tts_request, "0.0.0.0", 6007, max_size=None):
+        print("Kokoro TTS WebSocket server listening on port 6007...")
         await asyncio.Future()
 
 if __name__ == "__main__":

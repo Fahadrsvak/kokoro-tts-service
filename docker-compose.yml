@@ -1,19 +1,15 @@
 version: '3.8'
-
 services:
   kokoro-tts:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: kokoro-tts
-    ports:
-      - "8880:8880"
-    environment:
-      - PORT=8880
-    restart: unless-stopped
+    restart: always
+    expose:
+      - "6007"
     networks:
       - coolify
-
 networks:
   coolify:
     external: true
